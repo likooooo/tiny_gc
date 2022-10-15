@@ -1,0 +1,9 @@
+.vscode
+.vs
+
+# 输出路径
+out
+build
+
+# 三方库目录
+3rdparty
