@@ -2,24 +2,18 @@
 struct A
 {
     A() : A(0) {}
-    A(uintptr_t _d) : d(_d)
+    /* explicit */ A(uintptr_t _d) : d(_d)
     {
         printf("constructed\n");
     }
-    uintptr_t d;
     ~A()
     {
         printf("destructed\n");
     }
+    uintptr_t d;
 };
-
 int main()
-{
-    {
-        constexpr unsigned int val = ~(32 - 1);
-        std::allocator<A> alloc;
-        alloc.allocate(10);
-    }
+{    
     using namespace tiny_gc;
     // 从系统分配内存, 交由 GC 管理释放
 	{
@@ -37,21 +31,24 @@ int main()
     }
     // 从 GC 分配内存, 并由 GC 管理释放
     {
+        using A = uintptr_t;
+        // 1. 类似 std::make_unique 方式构建两种智能指针, make_gc_shared<T[]>(size_t) 必须要 T 有无参构造函数
         auto p  = make_gc_shared<A>(1);
         auto p1 = make_gc_shared<A[]>(3);
 
         auto p2 = make_gc_unique<A[]>(3);
         auto p3 = make_gc_unique<A>(3);
 
+        // 2. 主动从 GC 拿空闲内存, 通过 placement new 来构建智能指针, 第 2 种方式更灵活, 可以对数组对象进行初始化构造.  
         void* buf = GC.take_mem_out<A>();
         assert(buf);
         std::shared_ptr<A> p4(new (buf)A(3), garbage_collector<A>());
         
-        constexpr int element_count = 3;
-        buf = GC.take_mem_out<A>(element_count);
+        buf = GC.take_mem_out<A[]>(3);
         assert(buf);
-        std::unique_ptr<A[], garbage_collector<A[]>> p5(new (buf)A[element_count]{ 1, 2, 3 });
+        std::unique_ptr<A[], garbage_collector<A[]>> p5(new (buf)A[3]{ 1, 2, 3 });
     }
+    // 回收所有空闲内存
     GC.collect();
     return 0;
 }

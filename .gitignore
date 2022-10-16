@@ -7,3 +7,5 @@ build
 
 # 三方库目录
 3rdparty
+
+CMakeSettings.json

@@ -6,8 +6,11 @@
 #include <map>
 #include <assert.h>
 #include <mutex>
+#include <malloc.h>
 
-#define GC_LOG(...) printf(__VA_ARGS__);
+#ifndef GC_LOG
+#   define GC_LOG(...) printf(__VA_ARGS__);
+#endif
 #define GC_ASSERT(condition) assert(condition)
 
 #if defined(ENABLE_HOOK_NEW_DELETE) && defined(_DEBUG)
@@ -43,6 +46,30 @@ namespace private_space
         }
         return index;
     }
+
+
+    //template <class _Yty, class = void>
+    //struct _Can_array_delete : false_type {};
+    //template <class _Yty>
+    //struct _Can_array_delete<_Yty, void_t<decltype(delete[] _STD declval<_Yty*>())>> : true_type {};
+
+    template<class T, class = void>
+    struct has_destructor : std::false_type {};
+    template<class T>
+    struct has_destructor<T, decltype(std::declval<T&>().~T())> : std::true_type {};
+    template<class T>
+    constexpr bool has_destructor_v = has_destructor<T>::value;
+
+    template<class T, class = void>
+    struct is_cpp_default_type : std::false_type {};
+    template<class T>
+    struct is_cpp_default_type <T, std::enable_if_t<
+        std::is_arithmetic_v<T> &&  // 算数类型
+        std::is_pointer_v<T>    &&  // 指针类型
+        true
+        >>: std::true_type{};
+    template<class T>
+    constexpr bool is_cpp_default_type_v = is_cpp_default_type<T>::value;
 }
 
 namespace tiny_gc
@@ -113,9 +140,12 @@ namespace tiny_gc
             return ptr;
         }
         // 尝试返回多个元素 T 的内存块指针, 如果 GC 没有符合条件的空闲内存, 会返回 nullptr;
-        template<class T> _NODISCARD void* take_mem_out(const size_t elementCount)
+        template<class T, enable_if_t<is_array_v<T>&& extent_v<T> == 0, int> = 0> 
+        _NODISCARD void* take_mem_out(const size_t elementCount)
         {
-            int requireBytes = elementCount * sizeof(T) + sizeof(array_ptr_header);
+            using ElementType = std::remove_extent_t<T>;
+
+            int requireBytes = elementCount * sizeof(ElementType) + sizeof(array_ptr_header);
             int index = private_space::hightest_bit_index(requireBytes) - 1;
             int block_index = requireBytes == 1 << index ? index : index + 1;
 
@@ -189,9 +219,19 @@ namespace tiny_gc
         {
             static_assert(0 < sizeof(T), "can't delete an incomplete type");
 
-            array_ptr_header* pObjCount = reinterpret_cast<array_ptr_header*>(ptr) - 1;
-            for (int i = 0; i < *pObjCount; i++) ptr[i].~TFrom();
-            GC.push_unused_mem<TFrom>(pObjCount, *pObjCount);
+            if constexpr (
+                (private_space::has_destructor_v<TFrom> ||  private_space::has_destructor_v<T>) &&
+                !std::is_pod_v<TFrom>)
+            {
+                array_ptr_header* pObjCount = reinterpret_cast<array_ptr_header*>(ptr) - 1;
+                std::for_each(ptr, ptr + *pObjCount, [](TFrom& t) {t.~TFrom(); });
+                GC.push_unused_mem<TFrom>(pObjCount, *pObjCount);
+            }
+            else
+            {
+                GC.push_unused_mem<int8_t>(ptr, reinterpret_cast<int*>(ptr)[-4]);
+            }
+
         }
     };
     // 优先尝试从 GC 空闲内存中构建智能指针, 若相应内存块没有空闲内存, 则从堆上分配内存后构建.
@@ -204,25 +244,9 @@ namespace tiny_gc
     template <class T, enable_if_t<is_array_v<T>&& extent_v<T> == 0, int> = 0>                                                  \
     _NODISCARD gc_##type##_ptr<T> make_gc_##type(const size_t elementCount){                                                    \
         using ElementType = std::remove_extent_t<T>;                                                                            \
-        void* ptr = GC.take_mem_out<ElementType>(elementCount);                                                                 \
+        void* ptr = GC.take_mem_out<T>(elementCount);                                                                           \
         return ptr ? gc_##type##_ptr<T>(new(ptr)ElementType[elementCount]) : gc_##type##_ptr<T>(new ElementType[elementCount]); \
     }
     __DECLARE_MAKE_GC_PTR(unique);
     __DECLARE_MAKE_GC_PTR(shared);
 }
-/* struct gc_allocate_traits {
-     _DECLSPEC_ALLOCATOR static void* _Allocate(const size_t _Bytes) {
-
-         return ::operator new(_Bytes);
-     }
- };*/
-
- /* template<class T>
-  struct gc_allocator : public std::allocator<T>
-  {
-      using alloc_type = std::allocator<T>;
-      T* allocate(const size_t count)
-      {
-          return alloc_type::allocate(count);
-      }
-  };*/
