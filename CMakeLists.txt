@@ -12,4 +12,5 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} /DEBUG /OPT:REF /OPT:ICF")
 
 add_executable(tiny_gc example.cpp)
-add_executable(test.normal_distribution test.reuse_rate.cpp)
+add_executable(test.reuse_rate test.reuse_rate.cpp)
+target_link_libraries(test.reuse_rate psapi)

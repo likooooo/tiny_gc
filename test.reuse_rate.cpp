@@ -13,7 +13,9 @@
 #define GC_LOG
 #include "tiny_gc.hpp"
 
-#pragma comment(lib, "psapi.lib")
+#include <omp.h>
+#include <stdio.h>
+#include <iostream>
 
 #define DISABLE_LOG
 #ifndef DISABLE_LOG
@@ -74,7 +76,7 @@ int gen_mem_size()
 }
 
 // 内存存活率
-constexpr double alive_rate = 0.6;
+constexpr double alive_rate = 0.3;
 static_assert(0 < range_scala && range_scala < 1, "out of range");
 bool is_mem_still_alive()
 {
@@ -95,57 +97,46 @@ size_t/* byte */ get_proc_total_mem()
 }
 
 // 分配用于容纳 may_max 数据的 bit 位数
-constexpr int data_bit_count = 14;
+constexpr int data_bit_count = 15;
 static_assert(1 << (data_bit_count + 1) - 1 > may_max, " data bit count is small");
 using data_container = decltype(private_space::test_data_container<data_bit_count>());
-constexpr int flag_bit_count = (8 * sizeof(data_container) - data_bit_count) / 2;
+constexpr int flag_bit_count = (8 * sizeof(data_container) - data_bit_count);
 // 一帧测试状态
 struct test_frame_record
 {
 	data_container  mem_size		: data_bit_count;
-	data_container  reuse_success	: flag_bit_count;
 	data_container  is_alive		: flag_bit_count;
-	test_frame_record(data_container size, bool reused, bool alive) : mem_size(size), reuse_success(reused), is_alive(alive){}
+	test_frame_record(data_container size, bool alive) : mem_size(size),  is_alive(alive){}
 };
 int main()
 {
 	using test_ptr = gc_unique_ptr<char[]>;
-	constexpr int test_times = 1000000;
+	constexpr int test_times = 100000;
 
 	vector<test_ptr> user;
+	mutex user_lock;
 	vector<test_frame_record> frame_datas;
 	user.reserve(test_times);
 	frame_datas.reserve(test_times);
 
-	void* ptr;
-	int success_times = 0, mem_die_count = 0;
 
 	auto mem_snapshoot_begin = get_proc_total_mem();
-	for (int i = 0, mem_size = 0, is_alive = 0; i < test_times; i++)
+#	pragma omp parallel for num_threads(4)
 	{
-		mem_size = (int)gen_mem_size();
-		printf("begin malloc mem size : %d\n", mem_size);
-		assert(0 < mem_size);
+		for (int i = 0; i < test_times; i++)
+		{
+			int mem_size = (int)gen_mem_size();
+			assert(0 < mem_size);
+			void* ptr = GC.take_mem_out<char[]>(mem_size);
+			assert(ptr);
+			{
+				std::lock_guard<std::mutex> lock(user_lock);
+				user.emplace_back(new (ptr)char[mem_size] {0});
+				if (!is_mem_still_alive()) test_ptr().swap(*user.rbegin());
+				frame_datas.emplace_back(mem_size, nullptr != *user.rbegin());
+			}
 
-		ptr = GC.take_mem_out<char[]>(mem_size);
-
-		if (ptr)
-		{
-			success_times++;
-			user.emplace_back(new (ptr)char[mem_size] {0});
 		}
-		else
-		{
-			user.emplace_back(new char[mem_size] {0});
-		}
-		is_alive = is_mem_still_alive();
-		if (!is_alive)
-		{
-			test_ptr empty_ptr;
-			user.rbegin()->swap(empty_ptr);
-			mem_die_count++;
-		}
-		frame_datas.emplace_back(mem_size, static_cast<bool>(ptr), is_alive);
 	}
 	auto mem_snapshoot_end = get_proc_total_mem();
 	
@@ -154,11 +145,22 @@ int main()
 			return current + frame.mem_size; 
 		}
 	);
-	printf(
-		"memory reuse rate : %lf\n"
-		"%memory increase actually : %lf kb, total memory alloc : %lf kb\n",
-		static_cast<double>(success_times) / mem_die_count, 
-		static_cast<double>(mem_snapshoot_end - mem_snapshoot_begin) / 1000, static_cast<double>(byte_sum) / 1000
+	size_t alive_sum = std::accumulate(frame_datas.begin(), frame_datas.end(), 0,
+		[](size_t current, const test_frame_record& frame) {
+			return frame.is_alive ? current + 1 : current;
+		}
 	);
+	printf("system :\n    memory grouth actually : %lf mb\n",
+		static_cast<double>(mem_snapshoot_end - mem_snapshoot_begin) / (1 << 20)
+	);
+	printf("user :\n    memory death rate : %lf\n    memory used : %lf mb\n", 
+		1.0 - static_cast<double>(alive_sum) / test_times,
+		static_cast<double>(byte_sum) / (1 << 20)
+	);
+	printf("gc :\n    pointer reuse rate : %lf\n    memory reuse rate : %lf\n",
+		static_cast<double>(GC.reuse_success_times) / GC.reuse_require_times,
+		static_cast<double>(mem_snapshoot_end - mem_snapshoot_begin) / byte_sum
+	);
+	GC.collect();
 	system("pause");
 }

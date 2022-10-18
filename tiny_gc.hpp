@@ -7,6 +7,7 @@
 #include <assert.h>
 #include <mutex>
 #include <malloc.h>
+#include <atomic>
 
 #ifndef GC_LOG
 #   define GC_LOG(...) printf(__VA_ARGS__);
@@ -76,6 +77,7 @@ namespace tiny_gc
 {
     using std::vector;
     using std::mutex;
+    using std::atomic;
     using std::enable_if_t;
     using std::unique_ptr;
     using std::shared_ptr;
@@ -94,15 +96,34 @@ namespace tiny_gc
         template <class TFrom>
         gc_shared_ptr(TFrom* ptr) : shared_ptr<T>(ptr, tiny_gc::garbage_collector<T>()) {}
     };
+    struct gc_debugger
+    {
+#ifndef DISABLE_GC_DEBUG
+        void record_reuse_mem_success()
+        {
+            reuse_success_times++;
+            reuse_require_times++;
+        }
+        void record_reuse_mem_failed()
+        {
+            reuse_require_times++;
+        }
+        atomic<size_t> reuse_success_times{ 0 };
+        atomic<size_t> reuse_require_times{ 0 };
+#else
+        void record_reuse_mem_success() {}
+        void record_reuse_mem_failed() {}
+#endif
+    };
     // 32 个block, 每个 block 的 index 为 [0, 32), 代表内存块大小为 : 1 << index
     constexpr int max_block_count = 8 * sizeof(int);
     // GC 内存管理
-    class gc_manager final
+    class gc_manager final : public gc_debugger
     {
         struct thread_save_vector
         {
-            vector<void*> container;
-            mutex container_lock;
+            vector<void*> container; 
+            mutex container_lock;   // 如果 container 能预设大小, 可以用原子操作替换 lock
 
             void push_back(void* obj) 
             {
@@ -112,45 +133,76 @@ namespace tiny_gc
             void* take_last_out()
             {
                 gc_lock lock(container_lock);
-                void* p = nullptr;
                 if (container.size())
                 {
-                    p = *container.rbegin();
-                    container.erase(container.end() - 1);
+                    void* p = *container.rbegin();
+                    container.pop_back();
+                    return p;
                 }
-                return p;
+                return nullptr;
             }
         };
-
         thread_save_vector memory_block_available[max_block_count];
     public:
         ~gc_manager()
         {
             collect();
         }
-        // 尝试返回单个元素 T 的内存块指针, 如果 GC 没有符合条件的空闲内存, 会返回 nullptr;
+        // 尝试返回单个元素 T 的内存块指针, 如果 GC 没有符合条件的空闲内存, 会通过 malloc 构建
         template<class T> _NODISCARD void* take_mem_out()
         {
             constexpr int index = private_space::hightest_bit_index<sizeof(T)>() - 1;
-            constexpr int block_index = sizeof(T) == 1 << index ? index : index + 1;
+            constexpr int block_index = sizeof(T) <= 1 << index ? index : index + 1;
+            constexpr int current_max_mem_size = 1 << block_index;
             static_assert(block_index < max_block_count, "out of range");
 
-            void* ptr = memory_block_available[block_index].take_last_out();
-            GC_LOG("[ block-%2d ] take memory out from GC %p\n", block_index, ptr);
+            void* ptr;
+            if (memory_block_available[block_index].container.size())
+            {
+                ptr = memory_block_available[block_index].take_last_out();
+                gc_debugger::record_reuse_mem_success();
+                GC_LOG("[ block-%2d ] take memory out from GC %p\n", block_index, ptr);
+                return ptr;
+            }
+            ptr = malloc(current_max_mem_size);
+            GC_LOG("[ block-%2d ] malloc new memory by GC %p\n", block_index, ptr);
+            gc_debugger::record_reuse_mem_failed();
+
             return ptr;
         }
-        // 尝试返回多个元素 T 的内存块指针, 如果 GC 没有符合条件的空闲内存, 会返回 nullptr;
+        // 尝试返回多个元素 T 的内存块指针, 如果 GC 没有符合条件的空闲内存, 会通过 malloc 构建
         template<class T, enable_if_t<is_array_v<T>&& extent_v<T> == 0, int> = 0> 
         _NODISCARD void* take_mem_out(const size_t elementCount)
         {
             using ElementType = std::remove_extent_t<T>;
 
-            int requireBytes = elementCount * sizeof(ElementType) + sizeof(array_ptr_header);
+            int requireBytes, block_index;
+            if constexpr (
+                private_space::has_destructor_v<T> &&
+                !std::is_pod_v<T>)
+            {
+                requireBytes = elementCount * sizeof(ElementType) + sizeof(array_ptr_header);
+            }
+            else
+            {
+                requireBytes = elementCount * sizeof(ElementType);
+            }
             int index = private_space::hightest_bit_index(requireBytes) - 1;
-            int block_index = requireBytes == 1 << index ? index : index + 1;
+            block_index = requireBytes <= 1 << index ? index : index + 1;
+            int current_max_mem_size = 1 << block_index;
 
-            void* ptr = memory_block_available[block_index].take_last_out();
-            GC_LOG("[ block-%2d ] take memory out from GC %p\n", block_index, ptr);
+            void* ptr;
+            if (memory_block_available[block_index].container.size())
+            {
+                ptr = memory_block_available[block_index].take_last_out();
+                gc_debugger::record_reuse_mem_success();
+                GC_LOG("[ block-%2d ] take memory out from GC %p\n", block_index, ptr);
+                return ptr;
+            }
+            ptr = malloc(current_max_mem_size);
+            GC_LOG("[ block-%2d ] malloc new memory by GC %p\n", block_index, ptr);
+            gc_debugger::record_reuse_mem_failed();
+
             return ptr;
         }
         // 将内存交给 GC 管理
@@ -163,14 +215,13 @@ namespace tiny_gc
             GC_LOG("[ block-%2d ] push unused memory to GC %p, mem bytes : %zd\n", block_index, ptr, sizeof(T));
         }
         // 将数组内存交给 GC 管理
-        template<class T> void push_unused_mem(void* ptr, int elementCount)
+        void push_unused_mem(void* ptr, const int totalByte)
         {
-            const int totalByte = elementCount * sizeof(T) + sizeof(array_ptr_header);
             int block_index = private_space::hightest_bit_index(totalByte) - 1;
             GC_ASSERT(block_index < max_block_count);
 
             memory_block_available[block_index].push_back(ptr);
-            GC_LOG("[ block-%2d ] push unused memory to GC %p, mem bytes : %d, array count : %d\n", block_index, ptr, totalByte, elementCount);
+            GC_LOG("[ block-%2d ] push unused memory to GC %p, mem bytes : %d\n", block_index, ptr, totalByte);
         }
         // 回收所有空闲内存
         void collect()
@@ -204,7 +255,7 @@ namespace tiny_gc
             static_assert(0 < sizeof(T), "can't delete an incomplete type");
 
             ptr->~T();
-            GC.push_unused_mem<T>(ptr);
+            GC.push_unused_mem(ptr, reinterpret_cast<int*>(ptr)[-4]);
         }
     };
     // 数组类型智能指针垃圾回收的扩展
@@ -225,27 +276,29 @@ namespace tiny_gc
             {
                 array_ptr_header* pObjCount = reinterpret_cast<array_ptr_header*>(ptr) - 1;
                 std::for_each(ptr, ptr + *pObjCount, [](TFrom& t) {t.~TFrom(); });
-                GC.push_unused_mem<TFrom>(pObjCount, *pObjCount);
+                GC.push_unused_mem(pObjCount, reinterpret_cast<int*>(pObjCount)[-4]);
             }
             else
             {
-                GC.push_unused_mem<int8_t>(ptr, reinterpret_cast<int*>(ptr)[-4]);
+                GC.push_unused_mem(ptr, reinterpret_cast<int*>(ptr)[-4]);
             }
 
         }
     };
     // 优先尝试从 GC 空闲内存中构建智能指针, 若相应内存块没有空闲内存, 则从堆上分配内存后构建.
 #define __DECLARE_MAKE_GC_PTR(type)    \
-    template<class T, class... Args, enable_if_t<!is_array_v<T>, int> = 0>                                                                  \
-    _NODISCARD gc_##type##_ptr<T> make_gc_##type(Args&&... args){                                                                           \
-        void* ptr = GC.take_mem_out<T>();                                                                                                   \
-        return ptr ? gc_##type##_ptr<T>(new(ptr)T(std::forward<Args>(args)...)) : gc_##type##_ptr<T>(new T(std::forward<Args>(args)...));   \
-    }                                                                                                                                       \
-    template <class T, enable_if_t<is_array_v<T>&& extent_v<T> == 0, int> = 0>                                                  \
-    _NODISCARD gc_##type##_ptr<T> make_gc_##type(const size_t elementCount){                                                    \
-        using ElementType = std::remove_extent_t<T>;                                                                            \
-        void* ptr = GC.take_mem_out<T>(elementCount);                                                                           \
-        return ptr ? gc_##type##_ptr<T>(new(ptr)ElementType[elementCount]) : gc_##type##_ptr<T>(new ElementType[elementCount]); \
+    template<class T, class... Args, enable_if_t<!is_array_v<T>, int> = 0>  \
+    _NODISCARD gc_##type##_ptr<T> make_gc_##type(Args&&... args){           \
+        void* ptr = GC.take_mem_out<T>();                                   \
+        assert(ptr);                                                        \
+        return gc_##type##_ptr<T>(new(ptr)T(std::forward<Args>(args)...));  \
+    }                                                                       \
+    template <class T, enable_if_t<is_array_v<T>&& extent_v<T> == 0, int> = 0>  \
+    _NODISCARD gc_##type##_ptr<T> make_gc_##type(const size_t elementCount){    \
+        using ElementType = std::remove_extent_t<T>;                            \
+        void* ptr = GC.take_mem_out<T>(elementCount);                           \
+        assert(ptr);                                                            \
+        return gc_##type##_ptr<T>(new(ptr)ElementType[elementCount]);           \
     }
     __DECLARE_MAKE_GC_PTR(unique);
     __DECLARE_MAKE_GC_PTR(shared);

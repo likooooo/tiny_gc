@@ -33,20 +33,20 @@ int main()
     {
         using A = uintptr_t;
         // 1. 类似 std::make_unique 方式构建两种智能指针, make_gc_shared<T[]>(size_t) 必须要 T 有无参构造函数
-        auto p  = make_gc_shared<A>(1);
+        auto p  = make_gc_shared<A>(11);
         auto p1 = make_gc_shared<A[]>(3);
 
         auto p2 = make_gc_unique<A[]>(3);
-        auto p3 = make_gc_unique<A>(3);
+        auto p3 = make_gc_unique<A>(12);
 
         // 2. 主动从 GC 拿空闲内存, 通过 placement new 来构建智能指针, 第 2 种方式更灵活, 可以对数组对象进行初始化构造.  
         void* buf = GC.take_mem_out<A>();
         assert(buf);
-        std::shared_ptr<A> p4(new (buf)A(3), garbage_collector<A>());
+        std::shared_ptr<A> p4(new (buf)A(13), garbage_collector<A>());
         
         buf = GC.take_mem_out<A[]>(3);
         assert(buf);
-        std::unique_ptr<A[], garbage_collector<A[]>> p5(new (buf)A[3]{ 1, 2, 3 });
+        std::unique_ptr<A[], garbage_collector<A[]>> p5(new (buf)A[3]{ 11, 12, 13 });
     }
     // 回收所有空闲内存
     GC.collect();
